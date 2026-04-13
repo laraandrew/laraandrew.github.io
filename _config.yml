@@ -6,7 +6,6 @@ baseurl: ""
 
 theme: minima
 minima:
-  skin: dark
   date_format: "%B %d, %Y"
   social_links:
     - { platform: github, user_url: "https://github.com/laraandrew" }
