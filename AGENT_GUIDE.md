@@ -57,5 +57,5 @@ No build step required — GitHub Pages builds automatically on every push to `m
 ## Deployment
 
 - **No manual deploy needed.** Push to `main` = published.
-- GitHub Pages uses the `jekyll-theme-chirpy` theme.
+- GitHub Pages uses the `minima` theme with dark skin.
 - Live at: `https://blog.andrewlara.com` (and `https://laraandrew.github.io`)
