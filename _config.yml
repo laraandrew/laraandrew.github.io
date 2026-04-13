@@ -1,0 +1,28 @@
+title: Andrew Lara
+tagline: "Software engineer. Builder."
+description: "Notes on engineering, AI, and building things."
+url: "https://blog.andrewlara.com"
+baseurl: ""
+theme: jekyll-theme-chirpy
+
+author:
+  name: Andrew Lara
+  url: https://andrew-lara.com
+
+github:
+  username: laraandrew
+
+social:
+  name: Andrew Lara
+  email: ""
+  links:
+    - https://github.com/laraandrew
+    - https://andrew-lara.com
+
+timezone: America/Chicago
+lang: en
+
+# Chirpy settings
+toc: true
+comments: false
+paginate: 10
