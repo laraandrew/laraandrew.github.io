@@ -1,0 +1,13 @@
+# Jekyll build output
+_site/
+.jekyll-cache/
+.jekyll-metadata
+
+# Bundler and Ruby artifacts
+.bundle/
+vendor/
+vendor/bundle/
+Gemfile.lock
+
+# macOS
+.DS_Store
