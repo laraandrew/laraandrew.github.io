@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "The Price of Thinking: CostAwareToolEnv"
-date: 2026-04-13
+date: 2026-04-22
 authors: "Andrew Lara, Yashaswi Sharma, Defu Cao, Muyan Weng"
 description: "CostAwareToolEnv is an OpenEnv-native RL benchmark where LLM agents learn cost-aware tool orchestration across six tools and four benchmarks under a shared budget."
 categories: [ai, engineering, projects]
@@ -125,7 +125,7 @@ math: true
   <div class="btn-group">
     <a class="btn" href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">Live Environment Space →</a>
     <a class="btn btn-outline" href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank">GitHub Repo</a>
-    <a class="btn btn-outline" href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/13/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog Post</a>
+    <a class="btn btn-outline" href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/22/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog Post</a>
   </div>
 
   <!-- ============================================================ -->
@@ -562,7 +562,7 @@ python baselines/oracle.py
     <p style="margin-top:.5rem;">
       <a href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank">GitHub</a> ·
       <a href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">HF Env Space</a> ·
-      <a href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/13/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog</a> ·
+      <a href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/22/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog</a> ·
       <a href="https://github.com/meta-pytorch/OpenEnv" target="_blank">OpenEnv</a> ·
       <a href="https://huggingface.co/docs/trl/en/openenv" target="_blank">TRL × OpenEnv</a>
     </p>
