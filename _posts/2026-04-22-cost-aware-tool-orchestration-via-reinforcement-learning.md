@@ -91,6 +91,7 @@ math: true
 <nav class="topnav">
   <a href="#top" class="brand"><span class="dot"></span> CostAwareToolEnv</a>
   <div class="links">
+    <a href="/">Home</a>
     <a href="#problem">Problem</a>
     <a href="#design">Design</a>
     <a href="#reward">Reward</a>
@@ -560,6 +561,7 @@ python baselines/oracle.py
   <div class="footer">
     <p>CostAwareToolEnv · AgentX–AgentBeats Phase 2 · UC Berkeley RDI</p>
     <p style="margin-top:.5rem;">
+      <a href="/">Blog Home</a> ·
       <a href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank">GitHub</a> ·
       <a href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">HF Env Space</a> ·
       <a href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/22/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog</a> ·
