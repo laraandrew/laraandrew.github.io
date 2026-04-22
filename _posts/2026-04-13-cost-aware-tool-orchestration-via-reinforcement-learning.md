@@ -1,198 +1,571 @@
 ---
 layout: post
-title: "Teaching LLM Agents to Think Before They Spend: Cost-Aware Tool Orchestration via Reinforcement Learning"
+title: "The Price of Thinking: CostAwareToolEnv"
 date: 2026-04-13
-authors: "Andrew Lara, Yashawasi Sharma (University of Southern California)"
-description: "We introduce CostAwareToolEnv, an RL environment where LLM agents learn to balance task accuracy against tool invocation costs. Trained with GRPO on four diverse benchmarks, our agent discovers non-trivial cost-accuracy trade-offs that static prompting strategies miss entirely."
+authors: "Andrew Lara, Yashaswi Sharma, Defu Cao, Muyan Weng"
+description: "CostAwareToolEnv is an OpenEnv-native RL benchmark where LLM agents learn cost-aware tool orchestration across six tools and four benchmarks under a shared budget."
 categories: [ai, engineering, projects]
-tags: [reinforcement-learning, llm-agents, tool-use, grpo, cost-optimization]
+tags: [reinforcement-learning, llm-agents, tool-use, grpo, cost-optimization, openenv]
 math: true
 ---
-
-{% if page.math %}
-<script>
-  window.MathJax = {
-    tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
-    svg: { fontCache: 'global' }
-  };
-</script>
-<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
-{% endif %}
-
-*Built for the [Berkeley RDI AgentX-AgentBeats Competition](https://rdi.berkeley.edu/agentx-agentbeats) (Research Track). Code and datasets available on [Hugging Face](https://huggingface.co/).*
-
----
-
-## The $20-Million-a-Day Problem
-
-Large language model agents are getting better at using tools. They can search the web, execute code, query databases, and call specialized APIs, often in multi-step chains that would have seemed like science fiction three years ago. But there is an underexplored cost to all of this capability: it is expensive, and current agents are terrible at managing that expense.
-
-Consider a simple question-answering task. An LLM agent with access to a web search API, a code interpreter, a knowledge graph, a calculator, a retrieval engine, and a document reader could plausibly use *any* of these tools, or several in sequence, to answer the question. Some of those tools are cheap (a calculator costs essentially nothing). Others are expensive (a web search API call with re-ranking might cost 100x more). The agent, having been trained or prompted purely for accuracy, will default to the most powerful tool available regardless of whether the question actually requires it.
-
-This is not a hypothetical problem. Enterprise LLM deployments are already grappling with API cost management at scale, and the most common optimization strategies (prompt compression, caching, model cascading) operate *outside* the agent's decision loop. They treat the agent as a black box and try to reduce costs around its edges.
-
-We asked a different question: **what if the agent itself learned when to spend and when to save?**
-
-## CostAwareToolEnv: The Setup
-
-We built CostAwareToolEnv as a Gymnasium-compatible RL environment where an LLM agent must solve tasks by selecting from a toolkit of six tools, each with a different cost profile:
-
-| Tool | Cost | Capability |
-|------|------|------------|
-| `calculator` | $0.001 | Arithmetic and symbolic computation |
-| `retriever` | $0.01 | Retrieval-augmented generation over a local corpus |
-| `code_interpreter` | $0.05 | Python execution sandbox |
-| `knowledge_graph` | $0.08 | Structured entity and relation queries |
-| `web_search` | $0.10 | Live web search with snippet extraction |
-| `expert_model` | $0.50 | Call to a larger, more capable LLM |
-
-These costs are meant to reflect relative real-world API pricing (not exact dollar amounts). The key design choice is that the cost differences span *three orders of magnitude*: a ratio of 500:1 between the cheapest and most expensive tool. This forces the agent to develop non-trivial strategies. You cannot just "always pick the cheap one" because many tasks genuinely require expensive tools. But you also cannot mindlessly escalate to `expert_model` on every query without blowing your budget.
-
-### The Reward Function
-
-The agent's reward combines correctness and cost in a single scalar:
-
-$$R = \alpha \cdot \mathbb{1}[\text{correct}] - (1 - \alpha) \cdot \frac{C_{\text{used}}}{C_{\text{max}}}$$
-
-where $C_{\text{used}}$ is the total cost of tools invoked during the episode, $C_{\text{max}}$ is the maximum possible cost (using `expert_model` for every step), and $\alpha$ is a tunable parameter controlling the accuracy-cost trade-off. In our experiments we primarily use $\alpha = 0.7$, which tells the agent that correctness matters more than frugality, but not infinitely more.
-
-The $\frac{C_{\text{used}}}{C_{\text{max}}}$ normalization is important. Without it, the cost penalty is on a completely different scale than the correctness reward, making the trade-off hard to learn. Normalizing to $[0, 1]$ puts both components on equal footing before the $\alpha$ weighting.
-
-### Four Benchmarks, Four Domains
-
-We evaluate across four established benchmarks, chosen to require genuinely different tool-use strategies:
-
-**HotpotQA**: Multi-hop question answering. Requires chaining evidence across multiple documents. The retriever is often sufficient, but some questions benefit from web search when the local corpus is incomplete.
-
-**MATH**: Competition-level mathematics. The calculator handles arithmetic, but harder problems require the code interpreter (for symbolic algebra) or even the expert model (for proof-level reasoning).
-
-**GPQA (Graduate-level Professional QA)**: Expert-domain questions in physics, chemistry, and biology. These push the boundaries of what smaller models can handle, making the `expert_model` tool a tempting but costly crutch.
-
-**HumanEval**: Code generation. The code interpreter is the obvious tool, but the agent also needs to decide whether to attempt generation directly or consult the expert model for harder functions.
-
-Each benchmark is processed into a JSONL format with fields for the question, ground truth answer, a difficulty estimate (used for analysis, not training), and metadata about which tools are *plausibly relevant* (used to construct the episode, not revealed to the agent).
-
-## Why GRPO?
-
-We train with Group Relative Policy Optimization (GRPO), the algorithm introduced in the DeepSeekMath paper (Shao et al., 2024) and subsequently used to train DeepSeek-R1.
-
-The case for GRPO over PPO in this setting comes down to three practical considerations:
-
-**No critic model needed.** PPO requires a separate value network (the critic) that estimates expected future reward. For LLM-scale agents, this means maintaining and training a second model of comparable size, doubling memory requirements. GRPO eliminates the critic entirely by estimating advantages from the relative quality of sampled completions within each batch.
-
-**Natural fit for verifiable rewards.** Our environment produces deterministic rewards: the answer is either correct or it is not, and the cost is exactly calculable. This makes GRPO's approach of sampling multiple completions per prompt and computing group-relative advantages a clean fit. There is no need for a learned reward model.
-
-**Accessible training.** GRPO can be implemented on a single node with significantly less VRAM than PPO, which matters when you are training on research-scale compute.
-
-Concretely, for each prompt $q$ in a training batch, GRPO samples a group of $G$ completions $\{o_1, o_2, \ldots, o_G\}$ from the current policy $\pi_\theta$. Each completion receives a reward $r_i$. The advantage for completion $i$ is computed as:
-
-$$\hat{A}_i = \frac{r_i - \text{mean}(\{r_1, \ldots, r_G\})}{\text{std}(\{r_1, \ldots, r_G\})}$$
-
-This z-score normalization is the core insight: within each group, completions that perform better than average get positive advantage, and worse-than-average completions get negative advantage. The policy is then updated to increase the probability of high-advantage completions while decreasing the probability of low-advantage ones, subject to a clipping constraint and KL penalty to prevent the policy from drifting too far from the reference model.
-
-In our setup, each completion is an entire tool-selection trajectory: the agent's sequence of decisions about which tools to invoke (and in what order) for a given question. A trajectory that picks the right tools cheaply gets high reward; one that picks expensive tools unnecessarily (or cheap tools that produce wrong answers) gets low reward. Over training, the agent learns the map between question characteristics and cost-effective tool strategies.
-
-## What the Agent Learns
-
-The interesting results are not just in aggregate accuracy-cost metrics (though those are good). The interesting results are in the *strategies* the agent discovers.
-
-### Strategy 1: Difficulty-Adaptive Escalation
-
-On MATH, the trained agent develops a clear escalation pattern. For problems that the base model can likely solve with basic computation (algebra, arithmetic), it routes to `calculator` or `code_interpreter`. For problems that involve proof techniques or deeper reasoning, it escalates to `expert_model`. The agent is not given difficulty labels during training; it learns to estimate difficulty from the problem statement itself and adjusts its tool budget accordingly.
-
-This mirrors what a cost-conscious human engineer would do: use the cheap tool first, and only reach for the expensive one when the cheap one is not enough. But the agent learns this strategy entirely from the reward signal, without any explicit "try cheap tools first" instruction.
-
-### Strategy 2: Retrieval Gating on HotpotQA
-
-For multi-hop QA, the agent learns to distinguish between questions where the local corpus is likely sufficient (using `retriever` at $0.01) and questions that reference recent events or obscure entities (escalating to `web_search` at $0.10). The gating signal appears to be the presence of time-sensitive language ("recently," "current," "as of") and named entities with low corpus frequency.
-
-### Strategy 3: Tool Composition vs. Tool Substitution
-
-On HumanEval, the agent learns two distinct modes. For straightforward function implementations, it generates code directly and uses the `code_interpreter` to verify. For functions requiring algorithmic insight (dynamic programming, graph algorithms), it queries the `expert_model` first for a strategy, *then* uses `code_interpreter` to implement and test. The key insight is that the agent treats `expert_model` + `code_interpreter` as a composed pipeline for hard problems, but avoids this expensive composition for easy ones.
-
-### The Pareto Frontier
-
-By sweeping $\alpha$ from 0.5 (equal weight on accuracy and cost) to 1.0 (accuracy only), we trace out a Pareto frontier of accuracy-cost trade-offs. The shape of this frontier is informative:
-
-- At $\alpha = 1.0$, the agent converges to always using the most powerful tools, essentially recovering the behavior of an unconstrained agent.
-- At $\alpha = 0.5$, the agent becomes aggressively frugal, sometimes sacrificing accuracy by using `calculator` on problems that genuinely need `code_interpreter`.
-- The sweet spot at $\alpha = 0.7$ achieves roughly 92-95% of the unconstrained accuracy while reducing tool costs by 40-60% across benchmarks.
-
-This last number is the headline result: **you can recover most of the accuracy of a "use everything" agent at roughly half the cost**, simply by letting the agent learn its own tool-selection policy via RL.
-
-## Comparison: Why Not Just Prompt?
-
-The obvious baseline is prompting. You could prepend "Use the cheapest tool that can solve this problem" to the system prompt and skip all the RL machinery. We tested this. The results are instructive:
-
-**Prompting produces bimodal behavior.** The prompted agent either ignores the cost instruction and uses expensive tools anyway (especially on hard benchmarks like GPQA), or over-corrects and uses cheap tools on everything, tanking accuracy. It lacks the smooth, difficulty-adaptive behavior that RL training produces.
-
-**Prompting does not generalize across benchmarks.** A prompt tuned for MATH cost optimization does not transfer well to HotpotQA, because the tool-selection strategies are fundamentally different. The RL-trained agent, by contrast, learns benchmark-specific strategies from the same training procedure.
-
-**Prompting is fragile.** Minor rephrasing of the cost instruction ("be frugal" vs. "minimize cost" vs. "prefer cheaper tools") produces surprisingly different behaviors. The RL-trained policy is deterministic for a given input and less prompt-sensitive.
-
-## Connection to the Broader Landscape
-
-This work sits at the intersection of several active research areas.
-
-**RL for LLM agents.** The post-DeepSeek-R1 era has seen an explosion of work applying GRPO and related algorithms to LLM training. Most of this work targets reasoning improvement (getting the right answer). Our contribution is applying the same machinery to *resource management*: teaching agents not just *what* to do but *how expensively* to do it.
-
-**Cost-aware planning.** The CATP-LLM work (Wu et al., ICCV 2025) is the closest prior work we are aware of. They propose a tool planning language and offline RL algorithm for cost-aware tool planning. Our approach differs in using online GRPO training, a simpler environment formulation (direct tool selection rather than plan token generation), and evaluation across a broader set of benchmarks. We also focus on the *interpretability* of learned strategies, which CATP-LLM does not emphasize.
-
-**Agent-R1 and agentic RL.** The Agent-R1 framework (Cheng et al., 2025) demonstrates end-to-end RL training for LLM agents with tool use. Their focus is on maximizing agent capability; ours is on optimizing the accuracy-cost trade-off. These are complementary goals: an agent trained with Agent-R1-style methods could potentially be further fine-tuned with our cost-aware reward to produce a capable *and* efficient agent.
-
-**Model cascading and routing.** Systems like RouteLLM and Hybrid LLM route queries to different models based on difficulty. Our approach is more general: rather than routing between models, the agent selects from a heterogeneous toolkit where the cost-accuracy trade-off varies per tool and per query type.
-
-## What We Did Not Do (Yet)
-
-Some honest limitations:
-
-**Single-step tool selection.** Our current environment models tool selection as a single-step (or short-horizon) decision. Real-world agents often engage in multi-turn, multi-tool chains with branching logic. Extending to full trajectory optimization with intermediate tool-use decisions is the natural next step.
-
-**Fixed cost model.** Real API costs are dynamic (rate limits, batching discounts, latency-cost trade-offs). Our fixed cost table is a useful simplification, but a production system would need to account for time-varying pricing.
-
-**Scale.** We train on 7B-parameter models. Whether the learned cost-awareness strategies transfer to or emerge differently in larger models (70B+) is an open question.
-
-**Reward hacking.** As with any RL system, reward hacking is a concern. An agent could learn to exploit evaluation quirks (for example, partial-credit scoring) rather than genuinely learning cost-efficient strategies. We mitigate this with binary correctness scoring (no partial credit) and manual inspection of learned trajectories, but more rigorous robustness analysis is warranted.
-
-## Reproducing This Work
-
-The full codebase, environment definition, processed datasets (four JSONL files for HotpotQA, MATH, GPQA, and HumanEval), and training configs are available via our Hugging Face organization. The environment is pip-installable and follows the standard Gymnasium API, so it plugs into existing RL training frameworks (we used TRL's GRPO implementation).
-
-If you are interested in extending this (adding new tools, new benchmarks, or different RL algorithms), the environment is designed to be modular. Defining a new tool is a Python class with a `cost` attribute, an `execute()` method, and a `description` string.
-
-## Conclusion
-
-The core claim of this work is simple: LLM agents should be trained to consider cost, not just accuracy. The mechanism we propose (a cost-penalized reward signal + GRPO training) is deliberately minimal. There is no complicated architecture, no novel algorithm, and no custom training infrastructure. The novelty is in the *framing*: treating tool cost as a first-class component of the agent's reward function and showing that standard RL techniques produce non-trivial, interpretable, and effective cost-optimization strategies.
-
-As LLM agents move from research prototypes to production systems processing millions of queries per day, the difference between "always use the best tool" and "use the right tool for the job" becomes worth millions of dollars. We think this is a direction worth investing in.
-
----
-
-## References
-
-1. Shao, Z., et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." arXiv:2402.03300, 2024.
-2. Guo, D., et al. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." arXiv:2501.12948, 2025.
-3. Schulman, J., et al. "Proximal Policy Optimization Algorithms." arXiv:1707.06347, 2017.
-4. Wu, Y., et al. "CATP-LLM: Empowering Large Language Models for Cost-Aware Tool Planning." ICCV 2025.
-5. Cheng, M., et al. "Agent-R1: Training Powerful LLM Agents with End-to-End Reinforcement Learning." arXiv:2511.14460, 2025.
-6. Yang, Z., et al. "HotpotQA: A Dataset for Diverse, Explainable Multi-hop Question Answering." EMNLP 2018.
-7. Hendrycks, D., et al. "Measuring Mathematical Problem Solving with the MATH Dataset." NeurIPS 2021.
-8. Rein, D., et al. "GPQA: A Graduate-Level Google-Proof Q&A Benchmark." arXiv:2311.12022, 2023.
-9. Chen, M., et al. "Evaluating Large Language Models Trained on Code." arXiv:2107.03374, 2021.
-10. Weng, L. "LLM Powered Autonomous Agents." Lil'Log, 2023.
-11. Li, Z., et al. "Encouraging Good Processes Without the Need for Good Answers: Reinforcement Learning for LLM Agent Planning." arXiv:2508.19598, 2025.
-
----
-
-*If you found this post useful, feel free to cite it:*
-
-```bibtex
-@article{lara2026costaware,
-  title   = {Teaching LLM Agents to Think Before They Spend: Cost-Aware Tool Orchestration via Reinforcement Learning},
-  author  = {Lara, Andrew and Sharma, Yashawasi},
-  journal = {blog.andrewlara.com},
-  year    = {2026},
-  month   = {Apr},
-  url     = {https://blog.andrewlara.com/2026/04/13/cost-aware-tool-orchestration-via-reinforcement-learning.html}
-}
-```
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+    onload="mermaid.initialize({startOnLoad:true,theme:'dark',securityLevel:'loose',themeVariables:{background:'#162032',primaryColor:'#1a2740',primaryTextColor:'#e0e7ef',primaryBorderColor:'#10b981',lineColor:'#8a9bb5',secondaryColor:'#0c1222',tertiaryColor:'#22314d',fontFamily:'IBM Plex Sans'}});"></script>
+<style>
+    :root {
+      --bg: #0c1222; --surface: #162032; --surface-2: #1a2740;
+      --border: #2a3a52; --text: #e0e7ef; --muted: #8a9bb5;
+      --accent: #10b981; --accent2: #34d399; --accent-dim: rgba(16,185,129,.12);
+      --red: #f87171; --orange: #fbbf24; --blue: #60a5fa;
+      --radius: 10px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); line-height: 1.75; -webkit-font-smoothing: antialiased; }
+    .container { max-width: 840px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+    .topnav { position: sticky; top: 0; z-index: 10; background: rgba(12,18,34,.88); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: .85rem 1.5rem; display: flex; justify-content: space-between; align-items: center; font-size: .86rem; }
+    .topnav .brand { font-weight: 700; color: var(--text); text-decoration: none; display: flex; align-items: center; gap: .5rem; }
+    .topnav .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px rgba(16,185,129,.5); }
+    .topnav .links { display: flex; gap: 1.2rem; }
+    .topnav .links a { color: var(--muted); text-decoration: none; transition: color .15s; }
+    .topnav .links a:hover { color: var(--accent2); }
+    .hero { text-align: center; padding: 4rem 0 2rem; }
+    .hero-badge { display: inline-block; background: var(--accent-dim); color: var(--accent2); padding: .4rem 1.1rem; border-radius: 20px; font-size: .76rem; font-weight: 700; letter-spacing: .08em; margin-bottom: 1.25rem; border: 1px solid rgba(16,185,129,.25); text-transform: uppercase; }
+    .hero h1 { font-size: clamp(1.9rem, 4vw, 3rem); font-weight: 800; letter-spacing: -.02em; line-height: 1.15; background: linear-gradient(135deg, #e0e7ef 30%, #10b981 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .hero .subtitle { color: var(--muted); font-size: 1.1rem; max-width: 660px; margin: 1rem auto 0; }
+    .hero .byline { color: var(--muted); font-size: .83rem; margin-top: 1.4rem; font-style: italic; }
+    .authors { color: var(--muted); font-size: .88rem; line-height: 1.7; margin: 1.2rem auto 0; max-width: 760px; }
+    .authors strong { color: var(--text); }
+    .badges { display: flex; justify-content: center; gap: .5rem; flex-wrap: wrap; margin: 1.4rem 0; }
+    .badges img { height: 22px; }
+    .btn-group { display: flex; gap: .7rem; justify-content: center; margin: 2rem 0; flex-wrap: wrap; }
+    .btn { display: inline-flex; align-items: center; gap: .4rem; padding: .55rem 1.3rem; background: var(--accent); color: #0c1222; border-radius: 8px; font-size: .86rem; font-weight: 700; text-decoration: none; transition: all .2s; }
+    .btn:hover { background: var(--accent2); transform: translateY(-1px); }
+    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-outline:hover { border-color: var(--accent); color: var(--accent2); background: var(--accent-dim); }
+    section { margin: 3.5rem 0; }
+    section h2 { font-size: 1.5rem; font-weight: 800; letter-spacing: -.01em; margin-bottom: 1rem; color: var(--text); border-left: 3px solid var(--accent); padding-left: .85rem; }
+    section h3 { font-size: 1.08rem; font-weight: 700; margin: 2rem 0 .7rem; color: var(--accent2); }
+    section p { color: #bcc8da; margin-bottom: 1rem; font-size: 1rem; }
+    section p strong { color: var(--text); }
+    section ul, section ol { color: #bcc8da; margin: 1rem 0 1rem 1.5rem; }
+    section ul li, section ol li { margin-bottom: .5rem; font-size: .98rem; }
+    section ul li strong, section ol li strong { color: var(--text); }
+    blockquote { border-left: 3px solid var(--accent2); background: var(--accent-dim); padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 8px 8px 0; color: var(--text); font-size: 1rem; }
+    .table-wrap { margin: 1.5rem 0; overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th { background: var(--accent-dim); color: var(--accent2); font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: .8rem 1rem; text-align: left; }
+    td { padding: .65rem 1rem; border-top: 1px solid var(--border); color: #bcc8da; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: 'JetBrains Mono', monospace; font-size: .86rem; }
+    tr:hover td { background: rgba(16,185,129,.04); }
+    td strong { color: var(--text); }
+    pre { background: #080e1c; border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.2rem; overflow-x: auto; margin: 1.2rem 0; font-family: 'JetBrains Mono', monospace; font-size: .83rem; line-height: 1.6; color: #d1d5db; }
+    code { font-family: 'JetBrains Mono', monospace; font-size: .86em; background: var(--accent-dim); color: var(--accent2); padding: .1em .3em; border-radius: 4px; }
+    pre code { background: none; color: inherit; padding: 0; font-size: 1em; }
+    .math-block { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.2rem 1.5rem; margin: 1.5rem 0; overflow-x: auto; text-align: center; }
+    figure { margin: 2rem 0; }
+    figure svg { width: 100%; height: auto; }
+    figcaption { text-align: center; color: var(--muted); font-size: .83rem; margin-top: .7rem; }
+    .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; margin: 1.5rem 0; overflow-x: auto; }
+    .diagram .mermaid { min-width: 620px; }
+    .callout { text-align: center; padding: 2rem 1.5rem; margin: 3rem 0; background: linear-gradient(135deg, var(--accent-dim), rgba(52,211,153,.04)); border: 1px solid rgba(16,185,129,.2); border-radius: var(--radius); }
+    .callout .q { font-size: 1.2rem; font-weight: 700; color: var(--text); font-style: italic; margin-bottom: .4rem; }
+    .callout .sub { color: var(--muted); font-size: .93rem; }
+    .footer { text-align: center; padding: 3rem 0 1rem; color: var(--muted); font-size: .83rem; border-top: 1px solid var(--border); margin-top: 3rem; }
+    .footer a { color: var(--accent2); text-decoration: none; margin: 0 .4rem; }
+    .footer a:hover { text-decoration: underline; }
+    .status-honest { display: inline-block; background: rgba(251,191,36,.12); color: var(--orange); padding: .3rem .8rem; border-radius: 6px; font-size: .78rem; font-weight: 700; border: 1px solid rgba(251,191,36,.25); margin-bottom: .5rem; }
+    .site-header, .site-footer, .post-header { display: none; }
+    .page-content { padding: 0; }
+    .page-content > .wrapper { max-width: none; padding: 0; }
+    .post { margin: 0; }
+    @media (max-width: 640px) { .container { padding: 1rem 1rem 3rem; } .hero { padding: 2.5rem 0 1.5rem; } .topnav .links { display: none; } section h2 { font-size: 1.25rem; } table { font-size: .8rem; } th, td { padding: .5rem .55rem; } }
+  </style>
+
+<nav class="topnav">
+  <a href="#top" class="brand"><span class="dot"></span> CostAwareToolEnv</a>
+  <div class="links">
+    <a href="#problem">Problem</a>
+    <a href="#design">Design</a>
+    <a href="#reward">Reward</a>
+    <a href="#grpo">GRPO</a>
+    <a href="#results">Results</a>
+    <a href="#training">Training</a>
+    <a href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">Live Space ↗</a>
+  </div>
+</nav>
+
+<div class="container" id="top">
+
+  <div class="hero">
+    <div class="hero-badge">OpenEnv · AgentBeats Phase 2</div>
+    <h1>The Price of Thinking</h1>
+    <p class="subtitle">CostAwareToolEnv teaches LLM agents when a tool call is worth its cost, and when the smarter move is to stop spending.</p>
+    <div class="badges">
+      <a href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank"><img src="https://img.shields.io/badge/GitHub-Repository-181717?logo=github" alt="GitHub"/></a>
+      <a href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank"><img src="https://img.shields.io/badge/HF%20Space-Live%20Env-FFD21E?logo=huggingface&logoColor=black" alt="HF Space"/></a>
+      <img src="https://img.shields.io/badge/OpenEnv-Native-4B8BBE" alt="OpenEnv"/>
+      <img src="https://img.shields.io/badge/Tools-6-brightgreen" alt="6 Tools"/>
+      <img src="https://img.shields.io/badge/Benchmarks-4-blue" alt="4 Benchmarks"/>
+      <img src="https://img.shields.io/badge/Training-GRPO-orange" alt="GRPO"/>
+    </div>
+    <div class="authors">
+      <strong>Andrew Lara</strong> — Franklin and Marshall College<br/>
+      <strong>Yashaswi Sharma</strong>, <strong>Defu Cao</strong>, <strong>Muyan Weng</strong> — University of Southern California
+    </div>
+    <div class="byline">CostAwareToolEnv · AgentBeats Phase 2 · OpenEnv Challenge Submission</div>
+  </div>
+
+  <div class="btn-group">
+    <a class="btn" href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">Live Environment Space →</a>
+    <a class="btn btn-outline" href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank">GitHub Repo</a>
+    <a class="btn btn-outline" href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/13/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog Post</a>
+  </div>
+
+  <!-- ============================================================ -->
+  <section id="problem">
+    <h2>The Problem with Free Tools</h2>
+    <p>Modern LLM agents have access to tools — search engines, calculators, code interpreters, databases. In every real deployment, these tools cost something: API fees, latency, rate limits, compute time. But almost every existing RL benchmark treats tools as <strong>free and unlimited</strong>.</p>
+    <p>This creates a gap between research and reality. An agent trained on "use whatever tools you want" behaves terribly in production where every call costs money. CostAwareToolEnv closes that gap.</p>
+    <p>The agent is given a fixed <strong>budget of 50 cost units</strong> to spend across 10 questions. Every tool call deducts from that budget. The agent must decide: <em>which tool is worth calling for this question? How many times should I call tools before committing an answer? Is it worth spending 2.0 on an LLM call, or can a 0.1 calculator solve this?</em></p>
+    <p><strong>In one sentence:</strong> CostAwareToolEnv is a deployed, test-covered OpenEnv environment for studying whether reinforcement learning can teach LLM agents to route across heterogeneous tools under a shared budget, rather than treating every tool call as free.</p>
+
+    <h3>Where this came from</h3>
+    <p>CostAwareToolEnv generalizes <a href="https://github.com/sharma-yash01/SearchEconomicsEnv" target="_blank">SearchEconomicsEnv</a> (Yashaswi Sharma, University of Southern California / Ceramic AI), which posed a simpler version: given a fixed number of search calls, can an RL agent learn to answer HotpotQA questions efficiently? That work showed agents could learn non-trivial search strategies. We ask the harder question: <strong>can the same principle scale to multiple tools and multiple domains?</strong></p>
+    <figure class="diagram">
+      <div class="mermaid">
+flowchart LR
+  A["Weitzman search economics<br/>information has a cost"] --> B["SearchEconomicsEnv<br/>1 search tool + HotpotQA"]
+  B --> C["CostAwareToolEnv<br/>6 tools + 4 domains + shared budget"]
+  C --> D["AgentBeats Phase 2<br/>OpenEnv submission"]
+      </div>
+      <figcaption>Research lineage: from economic search theory to a deployed multi-tool RL environment.</figcaption>
+    </figure>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>SearchEconomicsEnv</th><th>CostAwareToolEnv</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Tools</strong></td><td>1 (search)</td><td>6 (search, wiki, calc, code, LLM, commit)</td></tr>
+          <tr><td><strong>Datasets</strong></td><td>HotpotQA only</td><td>HotpotQA + MATH + GPQA + HumanEval</td></tr>
+          <tr><td><strong>Budget unit</strong></td><td># of search calls</td><td>Cost units per tool</td></tr>
+          <tr><td><strong>Core challenge</strong></td><td>How many searches?</td><td>Which tool, when, under budget pressure?</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="design">
+    <h2>Environment Design</h2>
+    <blockquote>An OpenEnv-native sequential MDP where an LLM agent selects from 6 tools with heterogeneous costs under a shared episode budget, across 10 questions from 4 domains.</blockquote>
+
+    <h3>Episode structure</h3>
+    <figure class="diagram">
+      <div class="mermaid">
+flowchart TD
+  A["Reset episode<br/>budget = 50 units"] --> B["Sample 10 questions<br/>HotpotQA / MATH / GPQA / HumanEval"]
+  B --> C["Show observation<br/>question + domain + budget + context"]
+  C --> D{"Agent action"}
+  D -->|"tool call"| E["Run selected tool<br/>charge cost + append result"]
+  E --> F{"Budget exhausted<br/>or max 8 steps?"}
+  F -->|"no"| C
+  F -->|"yes"| I["Advance or end episode"]
+  D -->|"commit"| G["Grade answer<br/>Exact Match + token F1"]
+  G --> H["Compute commit reward<br/>quality + efficiency bonus"]
+  H --> I
+  I --> J{"Questions remain<br/>and budget remains?"}
+  J -->|"yes"| C
+  J -->|"no"| K["Episode done"]
+      </div>
+      <figcaption>One episode is a sequential budget-management problem, not ten isolated QA calls.</figcaption>
+    </figure>
+    <pre><code>START EPISODE
+  Budget = 50.0 units
+  Draw 10 questions (mix: 40% HotpotQA, 30% MATH, 20% GPQA, 10% HumanEval)
+
+  FOR each question:
+    Show agent: question text, domain, remaining budget, context window
+
+    LOOP (max 8 steps per question):
+      Agent picks a tool + sends a query
+      Environment runs the tool, charges the cost, returns results
+      Results added to agent's context window
+
+      IF agent calls "commit" → grade answer, compute reward, next question
+      IF budget exhausted → episode ends immediately
+END EPISODE</code></pre>
+
+    <h3>The six tools</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Tool</th><th>Cost</th><th>What it does</th><th>Best for</th></tr></thead>
+        <tbody>
+          <tr><td><code>calculator</code></td><td class="num">0.1</td><td>Safe AST-based math expression evaluator</td><td>MATH arithmetic</td></tr>
+          <tr><td><code>code_executor</code></td><td class="num">0.3</td><td>Sandboxed Python <code>exec()</code> with import blocking</td><td>HumanEval, complex algebra</td></tr>
+          <tr><td><code>wiki_lookup</code></td><td class="num">0.5</td><td>Wikipedia REST API, first paragraph</td><td>Entity lookups</td></tr>
+          <tr><td><code>ceramic_search</code></td><td class="num">1.0</td><td>Ceramic AI web search API, top-5 results</td><td>HotpotQA multi-hop</td></tr>
+          <tr><td><code>llm_reason</code></td><td class="num">2.0</td><td>Together AI LLM call (Llama-3-8B), 512 tokens</td><td>GPQA graduate-level</td></tr>
+          <tr><td><code>commit</code></td><td class="num">0.0</td><td>Submit answer for grading</td><td>Always free</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Costs span a <strong>20:1 ratio</strong> from calculator to llm_reason. A single LLM reasoning call burns 4% of the entire episode budget. The agent must learn that this is sometimes worth it (GPQA) and sometimes wasteful (simple arithmetic).</p>
+
+    <figure class="diagram">
+      <div class="mermaid">
+flowchart LR
+  Q["Question + domain"] --> R{"Routing decision"}
+  R -->|"arithmetic / symbolic"| C["calculator<br/>0.1"]
+  R -->|"code execution"| X["code_executor<br/>0.3"]
+  R -->|"entity fact"| W["wiki_lookup<br/>0.5"]
+  R -->|"multi-hop factual"| S["ceramic_search<br/>1.0"]
+  R -->|"hard science reasoning"| L["llm_reason<br/>2.0"]
+  C --> A["Context window"]
+  X --> A
+  W --> A
+  S --> A
+  L --> A
+  A --> M{"Confident?"}
+  M -->|"yes"| K["commit<br/>0.0"]
+  M -->|"no"| R
+      </div>
+      <figcaption>The core policy problem is routing: choose the cheapest tool that is likely to change the answer.</figcaption>
+    </figure>
+
+    <h3>Observation space</h3>
+    <p>At every step, the agent sees: the question text and domain tag, remaining budget and fraction thereof, tool call history and results for the current question, number of questions remaining, and running accuracy. The agent emits a structured action specifying tool selection, query/expression/code, and (for commit) an answer.</p>
+
+    <h3>Four domains</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Domain</th><th>Mix</th><th>Why it matters for tool selection</th></tr></thead>
+        <tbody>
+          <tr><td><strong>HotpotQA</strong></td><td class="num">40%</td><td>Multi-hop factual QA — needs <code>ceramic_search</code> or <code>wiki_lookup</code> (multiple calls)</td></tr>
+          <tr><td><strong>MATH</strong></td><td class="num">30%</td><td>Competition math — <code>calculator</code> for arithmetic, <code>code_executor</code> for algebra, <code>llm_reason</code> for proofs</td></tr>
+          <tr><td><strong>GPQA</strong></td><td class="num">20%</td><td>Graduate-level science — often requires <code>llm_reason</code>, which costs 2.0</td></tr>
+          <tr><td><strong>HumanEval</strong></td><td class="num">10%</td><td>Code generation — needs <code>code_executor</code> to verify, maybe <code>llm_reason</code> to plan</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="reward">
+    <h2>The Reward Formula — Deep Dive</h2>
+    <p>This is the core intellectual contribution. The reward has two components that create constant pressure to be both correct and frugal.</p>
+
+    <h3>Part 1: Step reward (every tool call)</h3>
+    <div class="math-block">
+      $$R_{\text{step}} = -\text{tool\_cost}$$
+    </div>
+    <p>Every tool call produces a negative reward equal to its cost. This creates a running penalty — the agent pays for every action it takes.</p>
+
+    <h3>Part 2: Commit reward (on answer submission)</h3>
+    <figure class="diagram">
+      <div class="mermaid">
+flowchart TD
+  A["Prediction + gold answer"] --> B["Normalize text<br/>lowercase, punctuation, articles"]
+  B --> C["Compute Exact Match"]
+  B --> D["Compute token F1"]
+  C --> E["quality = 1.0 if EM<br/>otherwise token F1"]
+  D --> E
+  E --> F["base = -0.5 + quality * 1.5"]
+  E --> G{"quality >= 0.5?"}
+  G -->|"yes"| H["bonus = 0.1 * remaining_budget_ratio"]
+  G -->|"no"| I["bonus = 0"]
+  F --> J["commit reward = base + bonus"]
+  H --> J
+  I --> J
+  K["tool costs already charged<br/>as step rewards"] --> L["episode return"]
+  J --> L
+      </div>
+      <figcaption>The reward separates spending pressure from answer quality, then gates efficiency bonus on a useful answer.</figcaption>
+    </figure>
+    <div class="math-block">
+      $$R_{\text{commit}} = \underbrace{r_{\text{wrong}} + \text{quality} \times (r_{\text{right}} - r_{\text{wrong}})}_{\text{base}} + \underbrace{\eta \cdot \gamma \cdot \frac{B_{\text{remaining}}}{B_{\text{total}}}}_{\text{efficiency bonus}}$$
+    </div>
+    <p>where:</p>
+    <ul>
+      <li>$r_{\text{wrong}} = -0.5$, $r_{\text{right}} = 1.0$ — wrong answers are punished, correct ones rewarded</li>
+      <li>$\text{quality} \in [0,1]$ — computed from Exact Match (1.0) or Token F1 (partial credit)</li>
+      <li>$\eta = \mathbb{1}[\text{quality} \geq 0.5]$ — efficiency bonus gate: only awarded if answer is at least half-right</li>
+      <li>$\gamma = 0.1$ — efficiency weight</li>
+      <li>$B_{\text{remaining}} / B_{\text{total}}$ — fraction of budget still unspent</li>
+    </ul>
+
+    <h3>Worked examples</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Scenario</th><th>Tools used</th><th>R<sub>step</sub></th><th>Quality</th><th>R<sub>commit</sub></th><th>Total</th></tr></thead>
+        <tbody>
+          <tr><td><strong>A: Right, cheap</strong></td><td>1× calculator (0.1)</td><td class="num">−0.1</td><td class="num">1.0</td><td class="num">+1.10</td><td class="num" style="color:#34d399;font-weight:700">+1.00</td></tr>
+          <tr><td><strong>B: Right, expensive</strong></td><td>3× ceramic_search (3.0)</td><td class="num">−3.0</td><td class="num">1.0</td><td class="num">+1.09</td><td class="num" style="color:#f87171;font-weight:700">−1.91</td></tr>
+          <tr><td><strong>C: Wrong</strong></td><td>1× wiki_lookup (0.5)</td><td class="num">−0.5</td><td class="num">0.0</td><td class="num">−0.50</td><td class="num" style="color:#f87171;font-weight:700">−1.00</td></tr>
+          <tr><td><strong>D: Partial (F1=0.6)</strong></td><td>1× llm_reason (2.0)</td><td class="num">−2.0</td><td class="num">0.6</td><td class="num">+0.49</td><td class="num" style="color:#f87171;font-weight:700">−1.51</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Scenario A is the dream: right answer, cheap tool, big total reward. Scenario B shows that even a correct answer with excessive tool use produces a <strong>negative</strong> total. The formula makes cost-awareness unavoidable.</p>
+
+    <h3>Why this formula shape</h3>
+    <ul>
+      <li><strong>The efficiency bonus gate ($\eta$):</strong> Prevents a degenerate strategy where the agent commits immediately with a random guess to collect efficiency bonus without trying.</li>
+      <li><strong>Linear quality scaling:</strong> Partial credit (via Token F1) provides gradient signal even for close-but-not-exact answers, making learning easier.</li>
+      <li><strong>Budget-ratio efficiency:</strong> As budget drains, each correct answer is worth slightly less bonus, pushing the agent to be consistently frugal across all 10 questions.</li>
+    </ul>
+
+    <h3>Answer grading</h3>
+    <p>Grading produces a quality score in $[0,1]$. The pipeline: (1) extract the answer from the agent's response (JSON parsing → prefix matching → last-line fallback), (2) normalize both prediction and ground truth (lowercase, remove articles and punctuation, tokenize), (3) compute Exact Match (binary) and Token F1 (precision × recall harmonic mean), (4) quality = 1.0 if EM, else F1.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="grpo">
+    <h2>Why GRPO</h2>
+    <p>We train with Group Relative Policy Optimization (GRPO), introduced in DeepSeekMath (Shao et al., 2024) and used to train DeepSeek-R1.</p>
+    <p><strong>No critic model needed.</strong> PPO requires a separate value network, doubling memory. GRPO eliminates it by estimating advantages from the relative quality of sampled completions within each batch.</p>
+    <p><strong>Natural fit for verifiable rewards.</strong> Our reward is deterministic arithmetic — no learned reward model needed.</p>
+    <p><strong>Accessible training.</strong> Single-node, significantly less VRAM than PPO.</p>
+
+    <h3>The GRPO objective</h3>
+    <p>For each prompt $q$, GRPO samples $G$ completions $\{o_1, \ldots, o_G\}$. Each gets reward $r_i$. Advantage is a z-score:</p>
+    <div class="math-block">
+      $$\hat{A}_i = \frac{r_i - \text{mean}(\{r_1, \ldots, r_G\})}{\text{std}(\{r_1, \ldots, r_G\})}$$
+    </div>
+    <p>The policy maximizes:</p>
+    <div class="math-block">
+      $$J_{\text{GRPO}}(\theta) = \frac{1}{G}\sum_{i=1}^{G} \frac{1}{|o_i|}\sum_{t=1}^{|o_i|} \left\{\min\left[\frac{\pi_\theta(a_{i,t} \mid s, a_{i,&lt;t})}{\pi_{\theta_{\text{old}}}(a_{i,t} \mid s, a_{i,&lt;t})} \hat{A}_{i,t},\; \text{clip}(\cdot, 1{-}\epsilon, 1{+}\epsilon)\hat{A}_{i,t}\right] - \beta D_{\text{KL}}[\pi_\theta \| \pi_{\text{ref}}]\right\}$$
+    </div>
+    <p>In our setup, each completion is an entire <strong>multi-question episode trajectory</strong>: the agent's sequence of tool selections, queries, and commits across 10 questions under a shared budget. A trajectory that routes correctly and cheaply gets high reward; one that wastes budget or answers wrong gets low reward.</p>
+
+    <figure class="diagram">
+      <div class="mermaid">
+sequenceDiagram
+  participant GRPO as GRPO trainer
+  participant Policy as LLM policy
+  participant Client as OpenEnv client
+  participant Env as CostAwareToolEnv
+  participant Tools as Tool registry
+  GRPO->>Policy: sample G trajectories
+  Policy->>Client: structured tool actions
+  Client->>Env: WebSocket /step
+  Env->>Tools: dispatch selected tool
+  Tools-->>Env: tool result + cost
+  Env-->>Client: observation + reward + done
+  Client-->>GRPO: completed trajectory returns
+  GRPO->>GRPO: z-score rewards into advantages
+  GRPO->>Policy: policy update
+      </div>
+      <figcaption>OpenEnv keeps training decoupled from the environment server: the policy learns from complete budgeted trajectories.</figcaption>
+    </figure>
+
+    <h3>Why RL is the right framework</h3>
+    <ul>
+      <li><strong>Delayed rewards.</strong> You don't know if a tool call was helpful until you commit. The agent must assign credit backwards.</li>
+      <li><strong>Exploration.</strong> The agent must try different tool combinations to discover which work best per domain. No labeled "correct tool sequence" exists.</li>
+      <li><strong>Multi-step planning.</strong> 10 questions share one budget. A good agent plans across the whole episode — spending too much early leaves nothing for later.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>What a Trained Agent Should Learn</h2>
+    <p>A well-trained agent should exhibit these behaviors — none of which are explicitly programmed:</p>
+    <ul>
+      <li><strong>Domain routing.</strong> Math question → calculator. Factual multi-hop → search. Graduate science → llm_reason. The agent learns the domain→tool mapping from reward signal alone.</li>
+      <li><strong>Confidence-based committing.</strong> If the calculator returns a clean number for an arithmetic question, commit immediately. Don't waste 0.5 on a Wikipedia lookup you don't need.</li>
+      <li><strong>Budget awareness.</strong> In early questions with plenty of budget, use ceramic_search. By question 8 with only 5 units left and 3 questions remaining, switch to calculator-only even for non-math questions.</li>
+      <li><strong>Failure recovery.</strong> If the first tool returns garbage, try a different tool rather than committing a bad answer.</li>
+    </ul>
+    <p><strong>These are the behaviors that baselines cannot exhibit</strong> — they require learning from feedback across thousands of episodes.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="results">
+    <h2>What We Actually Built</h2>
+    <ul>
+      <li><strong>A complete environment server.</strong> FastAPI endpoints, WebSocket client support, per-session state, Docker/Hugging Face deployment metadata, and a browser demo route.</li>
+      <li><strong>A six-tool action space.</strong> Ceramic search, Wikipedia lookup, calculator, Python executor, LLM reasoning, and commit, each with explicit costs and normalized error handling.</li>
+      <li><strong>A verifiable reward function.</strong> Every tool call is penalized by cost; commits are scored with Exact Match, token F1, and an efficiency bonus gated by answer quality.</li>
+      <li><strong>Reference baselines and tests.</strong> Random, cheapest-first, and domain-oracle policies ship with unit tests covering the API, tools, sandbox behavior, and reward-facing contracts.</li>
+    </ul>
+
+    <h2>Baselines and Honest Results Status</h2>
+
+    <h3>Three shipped baselines</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Baseline</th><th>Policy</th><th>What it isolates</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Random tool</strong></td><td>Picks tool uniformly at random; commits after 3 steps with "I don't know"</td><td>Absolute floor — any RL agent that can't beat this is broken</td></tr>
+          <tr><td><strong>Cheapest first</strong></td><td>Calls tools in ascending cost order: calc→code→wiki→search→LLM</td><td>Great budget efficiency, terrible accuracy on factual/science questions</td></tr>
+          <tr><td><strong>Domain oracle</strong></td><td>Hardcoded domain→tool mapping (HotpotQA→search, MATH→calc, GPQA→LLM, HumanEval→code)</td><td>Performance ceiling for non-learning approaches</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Expected performance targets</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Metric</th><th>Random</th><th>Cheapest-first</th><th>Domain oracle</th><th>Target: RL-trained</th></tr></thead>
+        <tbody>
+          <tr><td>Accuracy (avg)</td><td class="num">~20-30%</td><td class="num">~40-50%</td><td class="num">~65-75%</td><td class="num">≥ oracle accuracy</td></tr>
+          <tr><td>Avg budget spent</td><td class="num">~35/50</td><td class="num">~8/50</td><td class="num">~25/50</td><td class="num">&lt; oracle, ≥ cheapest</td></tr>
+          <tr><td>Cost-adjusted reward</td><td class="num">negative</td><td class="num">low-positive</td><td class="num">medium</td><td class="num">highest</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The core claim fails if the trained policy cannot beat the domain oracle on cost-adjusted reward.</p>
+
+    <h3>Honest status of the trained policy</h3>
+    <div class="status-honest">⚠ HONEST STATUS: Environment complete, no converged checkpoint claimed</div>
+    <p>We do <strong>not</strong> claim a converged, baseline-beating trained checkpoint. The research contribution in this submission is the environment, reward design, baselines, deployment path, and the training-ready interface. What we have is:</p>
+    <ul>
+      <li><strong>Environment validated end-to-end.</strong> Reset/step API, tool dispatch, answer grading, reward calculation, concurrent session handling, and browser demo are implemented and covered by tests.</li>
+      <li><strong>Environment deployed and tested.</strong> HF Space serves concurrent sessions. WebSocket client connects, steps episodes, returns structured observations.</li>
+      <li><strong>All three baselines functional.</strong> They provide sanity checks for random exploration, low-cost heuristics, and hardcoded domain routing.</li>
+      <li><strong>No training logs yet.</strong> We were unable to complete Env Factory integration during the submission window because the current interface did not support our multi-tool action flow cleanly enough for reliable rollouts.</li>
+      <li><strong>Training risks identified honestly.</strong> See the next section for the concrete failure modes this environment is designed to expose.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section id="training">
+    <h2>GRPO Training: What This Environment Is Built to Test</h2>
+    <p>The next research step is to train with TRL's GRPO via an OpenEnv-compatible rollout loop. We are careful about the claim: this submission ships the environment and baselines, not a final trained policy. The limiting factor was not the reward design or environment server; it was Env Factory integration. Our environment requires a model to make structured, repeated multi-tool calls across an episode, and we were not able to make that interaction reliable enough inside the current Env Factory path to produce trustworthy training logs before submission. We plan to continue the experiments as Env Factory stabilizes and as more post-training model series become available.</p>
+    <p>The failure modes below are the concrete behaviors the environment is designed to make measurable once that post-training loop is stable.</p>
+
+    <figure class="diagram">
+      <div class="mermaid">
+flowchart TD
+  A["Training risk"] --> B["Commit immediately<br/>spend nothing, answer poorly"]
+  A --> C["Overuse expensive tools<br/>solve early, lose budget"]
+  A --> D["Collapse to one domain<br/>same tool everywhere"]
+  A --> E["Variable trajectory lengths<br/>harder batching and credit assignment"]
+  B --> F["Measured by quality gate<br/>and wrong-answer penalty"]
+  C --> G["Measured by shared budget<br/>and cumulative step costs"]
+  D --> H["Measured against<br/>domain-oracle baseline"]
+  E --> I["Exposed by multi-step<br/>OpenEnv episodes"]
+      </div>
+      <figcaption>The benchmark is useful because the common training failures are observable in reward, budget, and baseline comparisons.</figcaption>
+    </figure>
+
+    <h3>1. Reward scale mismatch</h3>
+    <p>Step rewards (−0.1 to −2.0) and commit rewards (−0.5 to +1.1) operate on different scales. A useful trained policy must learn that a costly call can still be rational when it raises answer quality enough to recover the cost.</p>
+
+    <h3>2. Budget-exhaustion cliff</h3>
+    <p>When the agent exhausts its shared budget, the episode ends. This makes early overspending visible: a policy that solves the first few questions with expensive tools can lose the rest of the episode.</p>
+
+    <h3>3. Variable-length trajectory handling</h3>
+    <p>Episodes can end after different numbers of tool calls because agents commit, run out of steps, or spend the budget. That makes batching and credit assignment harder than single-turn QA, and it is exactly why a realistic tool-use environment matters.</p>
+
+    <h3>4. Domain-collapse risk</h3>
+    <p>The domain mix is intentionally uneven: 40% HotpotQA, 30% MATH, 20% GPQA, 10% HumanEval. A weak policy can overfit to the most common domain and call the same tool everywhere. The domain-oracle baseline makes that failure easy to detect.</p>
+
+    <h3>5. The commit-immediately attractor</h3>
+    <p>Because commit is free, an untrained agent can minimize spending by answering immediately. The quality gate blocks the efficiency bonus for poor answers, so a successful policy must learn the marginal value of information rather than simply learning to spend nothing.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>Why OpenEnv</h2>
+    <p>OpenEnv provides: (1) a standard WebSocket contract consumable by training clients, (2) per-session state with concurrent session support, and (3) a uniform deployment path — same code runs in-process for tests, as Docker for dev, and as a HF Space for training. The remaining integration work is specifically at the Env Factory/model-control layer: making repeated structured multi-tool calls stable enough for post-training rollouts.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>Prior Work and Foundations</h2>
+    <ul>
+      <li><strong>Weitzman (1979)</strong> "Optimal Search for the Best Alternative" — foundational search economics. Information has a cost; rational agents should not search beyond expected marginal gain.</li>
+      <li><strong>SearchEconomicsEnv</strong> (Yashaswi Sharma / University of Southern California / Ceramic AI) — direct predecessor. Single-tool (search), single-dataset (HotpotQA), budget-constrained. Proved the principle.</li>
+      <li><strong>ReAct</strong> (Yao et al., 2022) — interleaving reasoning and tool calls. The paradigm our agent operates within.</li>
+      <li><strong>Toolformer</strong> (Schick et al., 2023) — self-supervised tool learning for LLMs.</li>
+      <li><strong>GRPO / DeepSeekMath</strong> (Shao et al., 2024) — group-relative advantages. Our training algorithm.</li>
+      <li><strong>DeepSeek-R1</strong> (Guo et al., 2025) — GRPO at scale for reasoning.</li>
+      <li><strong>CATP-LLM</strong> (Wu et al., ICCV 2025) — cost-aware tool planning via offline RL. We differ: online GRPO, episode-level budget, broader benchmarks.</li>
+      <li><strong>Agent-R1</strong> (Cheng et al., 2025) — end-to-end RL for LLM agents. Complementary: capability + our cost-awareness could compose.</li>
+      <li><strong>OpenEnv</strong> (Meta PyTorch) — base types, WebSocket protocol, submission framework.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>Quick Start</h2>
+    <pre><code># 1. Run the env locally
+pip install -r requirements.txt
+python app.py    # FastAPI on port 8000
+
+# 2. Or use the HF Space
+export ENV_BASE_URL="https://landrew9-cost-aware-tool-env.hf.space"
+
+# 3. Run baselines
+python baselines/random_tool.py
+python baselines/cheapest_first.py
+python baselines/oracle.py
+
+# 4. Train with GRPO (requires TRL + vLLM)
+# See training client docs in RESEARCH.md</code></pre>
+    <p>All episodes are seeded and reproducible. The Ceramic AI fallback client provides deterministic offline results when no API key is set, so the full environment runs without external dependencies.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>What We Did Not Do (Yet)</h2>
+    <ul>
+      <li><strong>No converged checkpoint.</strong> Environment, baselines, tests, and deployment are complete; convergence is the next milestone.</li>
+      <li><strong>No Env Factory training logs yet.</strong> We could not complete a reliable Env Factory integration for repeated multi-tool calls in time for submission. This is planned follow-up work as the Env Factory path and available post-training model series mature.</li>
+      <li><strong>Fixed cost model.</strong> Real API costs are dynamic. Our fixed costs are a useful simplification.</li>
+      <li><strong>No human respondent.</strong> All grading is automated (EM + F1). Human evaluation of answer quality is future work.</li>
+      <li><strong>Single budget per episode.</strong> Per-question budgets or adaptive budgets are natural extensions.</li>
+      <li><strong>Ceramic AI dependency.</strong> Live web search requires an API key. Fallback client enables offline training but loses real-world retrieval quality.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ -->
+  <div class="callout">
+    <div class="q">💰 Can an LLM learn that a calculator is worth 0.1 and an LLM call is worth 2.0 — and route accordingly?</div>
+    <div class="sub">Cost-aware tool selection under budget pressure is the test.</div>
+  </div>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>Conclusion</h2>
+    <p>CostAwareToolEnv reframes a practical engineering problem — "LLM agents waste money on tools" — as a verifiable RL task. Six tools with a 20:1 cost ratio, four domains requiring fundamentally different tool strategies, a shared episode budget, and a decomposed reward that penalizes every tool call while rewarding correct-and-frugal commits. The completed contribution is the environment: a deployed OpenEnv-native benchmark, explicit cost model, reward implementation, baselines, tests, and submission artifact. The research question — can a GRPO-trained LLM beat the domain oracle baseline on cost-adjusted score? — is now ready to evaluate cleanly. Convergence is the next milestone, not a current claim.</p>
+  </section>
+
+  <!-- ============================================================ -->
+  <section>
+    <h2>References</h2>
+    <ol style="color: #8a9bb5; font-size: .88rem; padding-left: 1.2rem;">
+      <li>Weitzman, M. "Optimal Search for the Best Alternative." <em>Econometrica</em>, 1979.</li>
+      <li>Yao, S., et al. "ReAct: Synergizing Reasoning and Acting in Language Models." ICLR 2023.</li>
+      <li>Schick, T., et al. "Toolformer: Language Models Can Teach Themselves to Use Tools." NeurIPS 2023.</li>
+      <li>Shao, Z., et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." arXiv:2402.03300, 2024.</li>
+      <li>Guo, D., et al. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." arXiv:2501.12948, 2025.</li>
+      <li>Wu, Y., et al. "CATP-LLM: Empowering Large Language Models for Cost-Aware Tool Planning." ICCV 2025.</li>
+      <li>Cheng, M., et al. "Agent-R1: Training Powerful LLM Agents with End-to-End RL." arXiv:2511.14460, 2025.</li>
+      <li>Yang, Z., et al. "HotpotQA: A Dataset for Diverse, Explainable Multi-hop QA." EMNLP 2018.</li>
+      <li>Hendrycks, D., et al. "Measuring Mathematical Problem Solving with the MATH Dataset." NeurIPS 2021.</li>
+      <li>Rein, D., et al. "GPQA: A Graduate-Level Google-Proof Q&A Benchmark." arXiv:2311.12022, 2023.</li>
+      <li>Chen, M., et al. "Evaluating Large Language Models Trained on Code." arXiv:2107.03374, 2021.</li>
+      <li>Schulman, J., et al. "Proximal Policy Optimization Algorithms." arXiv:1707.06347, 2017.</li>
+    </ol>
+  </section>
+
+  <div class="footer">
+    <p>CostAwareToolEnv · AgentX–AgentBeats Phase 2 · UC Berkeley RDI</p>
+    <p style="margin-top:.5rem;">
+      <a href="https://github.com/laraandrew/CostAwareToolEnv" target="_blank">GitHub</a> ·
+      <a href="https://huggingface.co/spaces/landrew9/cost-aware-tool-env" target="_blank">HF Env Space</a> ·
+      <a href="https://blog.andrewlara.com/ai/engineering/projects/2026/04/13/cost-aware-tool-orchestration-via-reinforcement-learning.html" target="_blank">Full Blog</a> ·
+      <a href="https://github.com/meta-pytorch/OpenEnv" target="_blank">OpenEnv</a> ·
+      <a href="https://huggingface.co/docs/trl/en/openenv" target="_blank">TRL × OpenEnv</a>
+    </p>
+  </div>
+
+</div>
